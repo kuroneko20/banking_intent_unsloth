@@ -4,16 +4,22 @@ from datasets import load_dataset
 
 def preprocess():
     print("Loading BANKING77 dataset...")
-    # Đã thêm trust_remote_code=True để bypass lỗi bảo mật của Hugging Face
+    # Tải dataset mteb/banking77
     dataset = load_dataset("mteb/banking77")
-    labels = dataset["train"].features["label"].names
     
+    # Không cần lấy .names từ features nữa
     df_train = dataset["train"].to_pandas()
     df_test = dataset["test"].to_pandas()
     
-    # Label Mapping: Chuyển ID thành tên Intent dạng text
-    df_train["intent"] = df_train["label"].apply(lambda x: labels[x])
-    df_test["intent"] = df_test["label"].apply(lambda x: labels[x])
+    # Dataset mteb/banking77 đã có sẵn cột 'label_text' chứa tên intent dạng text
+    # Nên ta gán thẳng luôn sang cột 'intent':
+    if "label_text" in df_train.columns:
+        df_train["intent"] = df_train["label_text"]
+        df_test["intent"] = df_test["label_text"]
+    else:
+        # Dự phòng trường hợp cột mang tên khác
+        df_train["intent"] = df_train["label"]
+        df_test["intent"] = df_test["label"]
     
     # Text Normalization: Đưa về chữ thường và xóa khoảng trắng thừa
     df_train["text"] = df_train["text"].str.lower().str.strip()
