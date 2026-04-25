@@ -8,7 +8,7 @@ batch_size: 2 # Batch size nhỏ để tránh OOM trên Colab
 gradient_accumulation_steps: 4 # Tăng batch size ảo
 learning_rate: 2.0e-4 # Learning rate chuẩn cho LoRA
 optimizer: "adamw_8bit" # Optimizer tiết kiệm bộ nhớ
-num_train_epochs: 1 # Epochs (rút ngắn để demo)
+num_train_epochs: 3 # Epochs (rút ngắn để demo)
 output_dir: "outputs/banking-intent-model"
 train_data_path: "sample_data/train.csv"
 test_data_path: "sample_data/test.csv"

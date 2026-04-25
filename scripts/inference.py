@@ -3,7 +3,6 @@ import torch
 import warnings
 from unsloth import FastLanguageModel
 
-# Tắt toàn bộ các cảnh báo (Warnings) cho giao diện console sạch đẹp
 warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -25,11 +24,10 @@ class IntentClassification:
         FastLanguageModel.for_inference(self.model)
         
     def __call__(self, message):
-        # Ép mô hình chỉ trả lời bằng tên nhãn (exact label)
-        prompt = f"Classify the banking intent of the following text. Output ONLY the intent label name, nothing else.\nText: {message}\nIntent:"
+        # Đưa prompt về giống hệt 100% với lúc train
+        prompt = f"Classify the banking intent of the following text.\nText: {message}\nIntent:"
         
         inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
-        # Xóa bỏ tham số max_length ẩn gây xung đột warning, chỉ giữ max_new_tokens
         outputs = self.model.generate(
             **inputs, 
             max_new_tokens=15, 
@@ -45,14 +43,41 @@ if __name__ == "__main__":
     print("Initializing Model...")
     classifier = IntentClassification(model_path="configs/inference.yaml")
     
+    # --- PHẦN 1: DEMO VÀI CÂU MẪU (Cho Phần 2 của Video) ---
     test_messages = [
         "I lost my card yesterday, please help me block it.",
         "What is the exchange rate for USD to EUR?",
         "Why was I charged an extra fee for my ATM withdrawal?"
     ]
     
-    print("\n--- INFERENCE RESULTS ---")
+    print("\n--- 1. INFERENCE DEMO ---")
     for msg in test_messages:
         intent = classifier(message=msg)
         print(f"Input: {msg}")
         print(f"Predicted Intent: {intent}\n")
+
+
+    # --- PHẦN 2: ĐÁNH GIÁ ACCURACY TRÊN TEST SET (Cho Phần 3 của Video) ---
+    print("\n--- 2. EVALUATING ON TEST SET ---")
+    print("Loading sample_data/test.csv...")
+    try:
+        df_test = pd.read_csv("sample_data/test.csv")
+        y_true = df_test["intent"].tolist()
+        texts = df_test["text"].tolist()
+        y_pred = []
+        
+        print(f"Predicting {len(texts)} samples... (Please wait a moment)")
+        for text in texts:
+            # Dự đoán từng câu trong tập test
+            pred = classifier(message=text)
+            y_pred.append(pred)
+            
+        # Tính toán độ chính xác (Accuracy)
+        acc = accuracy_score(y_true, y_pred)
+        
+        print("\n==========================================")
+        print(f"✅ FINAL ACCURACY ON TEST SET: {acc * 100:.2f}%")
+        print("==========================================")
+        
+    except FileNotFoundError:
+        print("Error: Could not find sample_data/test.csv. Please run preprocess_data.py first.")
