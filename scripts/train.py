@@ -1,7 +1,7 @@
 import yaml
 import pandas as pd
 from datasets import Dataset
-from unsloth import FastLanguageModel
+from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl import SFTTrainer
 from transformers import TrainingArguments
 
@@ -62,8 +62,8 @@ def main():
             warmup_steps=5,
             num_train_epochs=config["num_train_epochs"],
             learning_rate=float(config["learning_rate"]),
-            fp16=not FastLanguageModel.is_bfloat16_supported(),
-            bf16=FastLanguageModel.is_bfloat16_supported(),
+            fp16=not is_bfloat16_supported(),
+            bf16=is_bfloat16_supported(),
             logging_steps=10,
             optim=config["optimizer"],
             weight_decay=0.01,
