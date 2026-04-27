@@ -1,8 +1,11 @@
 import yaml
 import torch
 import warnings
+import pandas as pd
+from sklearn.metrics import accuracy_score
 from unsloth import FastLanguageModel
 
+# Tắt các cảnh báo thừa để màn hình console sạch đẹp khi quay video
 warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -24,7 +27,6 @@ class IntentClassification:
         FastLanguageModel.for_inference(self.model)
         
     def __call__(self, message):
-        # Đưa prompt về giống hệt 100% với lúc train
         prompt = f"Classify the banking intent of the following text.\nText: {message}\nIntent:"
         
         inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
@@ -43,7 +45,7 @@ if __name__ == "__main__":
     print("Initializing Model...")
     classifier = IntentClassification(model_path="configs/inference.yaml")
     
-    # --- PHẦN 1: DEMO VÀI CÂU MẪU (Cho Phần 2 của Video) ---
+    # --- PHẦN 1: DEMO VÀI CÂU MẪU  ---
     test_messages = [
         "I lost my card yesterday, please help me block it.",
         "What is the exchange rate for USD to EUR?",
@@ -57,7 +59,7 @@ if __name__ == "__main__":
         print(f"Predicted Intent: {intent}\n")
 
 
-    # --- PHẦN 2: ĐÁNH GIÁ ACCURACY TRÊN TEST SET (Cho Phần 3 của Video) ---
+    # --- PHẦN 2: ĐÁNH GIÁ ACCURACY TRÊN TEST SET  ---
     print("\n--- 2. EVALUATING ON TEST SET ---")
     print("Loading sample_data/test.csv...")
     try:

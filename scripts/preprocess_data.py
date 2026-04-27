@@ -6,8 +6,6 @@ def preprocess():
     print("Loading BANKING77 dataset...")
     # Tải dataset mteb/banking77
     dataset = load_dataset("mteb/banking77")
-    
-    # Không cần lấy .names từ features nữa
     df_train = dataset["train"].to_pandas()
     df_test = dataset["test"].to_pandas()
     
