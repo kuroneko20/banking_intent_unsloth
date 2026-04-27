@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score
 from unsloth import FastLanguageModel
 
-# Tắt các cảnh báo thừa để màn hình console sạch đẹp khi quay video
+# Tắt các cảnh báo thừa để màn hình console sạch đẹp
 warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -30,22 +30,30 @@ class IntentClassification:
         prompt = f"Classify the banking intent of the following text.\nText: {message}\nIntent:"
         
         inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
-        outputs = self.model.generate(
-            **inputs, 
-            max_new_tokens=15, 
-            use_cache=True, 
-            pad_token_id=self.tokenizer.eos_token_id
-        )
+        
+        # Bọc trong no_grad để không lưu thông tin huấn luyện, tiết kiệm RAM
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, 
+                max_new_tokens=15, 
+                use_cache=True, 
+                pad_token_id=self.tokenizer.eos_token_id
+            )
         
         response = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
         predicted_label = response.split("Intent:")[-1].strip()
+        
+        # XÓA TENSOR VÀ DỌN DẸP BỘ NHỚ GPU SAU MỖI CÂU
+        del inputs, outputs
+        torch.cuda.empty_cache()
+        
         return predicted_label
 
 if __name__ == "__main__":
     print("Initializing Model...")
     classifier = IntentClassification(model_path="configs/inference.yaml")
     
-    # --- PHẦN 1: DEMO VÀI CÂU MẪU  ---
+    # --- PHẦN 1: DEMO VÀI CÂU MẪU ---
     test_messages = [
         "I lost my card yesterday, please help me block it.",
         "What is the exchange rate for USD to EUR?",
@@ -59,7 +67,7 @@ if __name__ == "__main__":
         print(f"Predicted Intent: {intent}\n")
 
 
-    # --- PHẦN 2: ĐÁNH GIÁ ACCURACY TRÊN TEST SET  ---
+    # --- PHẦN 2: ĐÁNH GIÁ ACCURACY TRÊN TEST SET ---
     print("\n--- 2. EVALUATING ON TEST SET ---")
     print("Loading sample_data/test.csv...")
     try:
@@ -68,12 +76,17 @@ if __name__ == "__main__":
         texts = df_test["text"].tolist()
         y_pred = []
         
-        print(f"Predicting {len(texts)} samples... (Please wait a moment)")
-        for text in texts:
-            # Dự đoán từng câu trong tập test
+        total_samples = len(texts)
+        print(f"Predicting {total_samples} samples... (This may take a few minutes)")
+        
+        for i, text in enumerate(texts):
             pred = classifier(message=text)
             y_pred.append(pred)
             
+            # In tiến trình sau mỗi 20 câu để dễ theo dõi
+            if (i + 1) % 20 == 0 or (i + 1) == total_samples:
+                print(f"  -> Processed {i + 1}/{total_samples} samples...")
+                
         # Tính toán độ chính xác (Accuracy)
         acc = accuracy_score(y_true, y_pred)
         
