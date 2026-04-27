@@ -5,20 +5,21 @@ from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl import SFTTrainer
 from transformers import TrainingArguments
 
-# Prompt template chuẩn cho classification
-prompt_template = """Classify the banking intent of the following text.
-Text: {}
-Intent: {}"""
+# Sử dụng Format Alpaca cực mạnh để ép mô hình tuân thủ tuyệt đối
+prompt_template = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Classify the banking intent of the following input text. Output ONLY the exact intent label and nothing else.
+
+### Input:
+{}
+
+### Response:
+{}"""
 
 def load_config(config_path="configs/train.yaml"):
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
-
-def format_prompts(examples):
-    texts = []
-    for text, intent in zip(examples["text"], examples["intent"]):
-        texts.append(prompt_template.format(text, intent))
-    return {"formatted_text": texts}
 
 def main():
     config = load_config()
@@ -31,7 +32,6 @@ def main():
         load_in_4bit=config["load_in_4bit"],
     )
     
-    # Thêm LoRA adapters
     model = FastLanguageModel.get_peft_model(
         model,
         r=config["lora_r"],
@@ -46,6 +46,15 @@ def main():
     print("Loading Data...")
     train_df = pd.read_csv(config["train_data_path"])
     train_dataset = Dataset.from_pandas(train_df)
+    
+    def format_prompts(examples):
+        texts = []
+        for text, intent in zip(examples["text"], examples["intent"]):
+            # Dạy mô hình điểm dừng tuyệt đối
+            formatted_text = prompt_template.format(text, intent) + tokenizer.eos_token
+            texts.append(formatted_text)
+        return {"formatted_text": texts}
+        
     train_dataset = train_dataset.map(format_prompts, batched=True)
     
     print("Initializing Trainer...")
@@ -58,9 +67,9 @@ def main():
         dataset_num_proc=2,
         args=TrainingArguments(
             per_device_train_batch_size=config["batch_size"],
-            gradient_accumulation_steps=config["gradient_accumulation_steps"],
+            gradient_accumulation_steps=config.get("gradient_accumulation_steps", 4),
             warmup_steps=5,
-            num_train_epochs=config["num_train_epochs"],
+            num_train_epochs=config["num_train_epochs"], # Vẫn giữ là 3 epochs nhé
             learning_rate=float(config["learning_rate"]),
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
