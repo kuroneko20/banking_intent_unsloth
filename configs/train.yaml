@@ -1,4 +1,15 @@
-model_checkpoint: "outputs/banking-intent-model"
+model_name: "unsloth/llama-3-8b-Instruct-bnb-4bit"
+max_seq_length: 256
+load_in_4bit: true
+lora_r: 32          # Tăng từ 16 → 32: capacity lớn hơn cho 77 classes
+lora_alpha: 64      # Giữ alpha = 2x r
+lora_dropout: 0.05  # Thêm dropout nhỏ để tránh overfit
+batch_size: 8
+gradient_accumulation_steps: 4
+learning_rate: 2e-4  # Tăng nhẹ từ 1e-4 → 2e-4
+optimizer: "adamw_8bit"
+num_train_epochs: 15  # Tăng từ 10 → 15 để loss giảm xuống < 0.2
 output_dir: "outputs/banking-intent-model"
 train_data_path: "sample_data/train.csv"
 test_data_path: "sample_data/test.csv"
+ 
