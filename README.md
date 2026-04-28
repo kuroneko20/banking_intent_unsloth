@@ -58,8 +58,8 @@ Downloads BANKING77 from HuggingFace and samples a balanced subset for training 
  
 Expected output:
 ```
-Train: 5390 samples | 77 classes
-  samples/class: min=70, max=70, avg=100.0
+Train: 5306 samples | 77 classes
+  samples/class: min=35, max=70, avg=68.9
 Test:  385 samples | 77 classes
 Saved to sample_data/
 ```
@@ -155,7 +155,7 @@ Pick label with highest score
 |---|---|
 | **Base model** | LLaMA 3 8B Instruct (4-bit NF4 quantized) |
 | **Dataset** | BANKING77 — 77 intent classes |
-| **Train set** | 7,700 samples (100 per class) |
+| **Train set** | 5,306 samples (68.9 per class) |
 | **Test set** | 385 samples (5 per class) |
 | **Trainable parameters** | ~42M of 8.07B (0.52%) |
 | **Hardware** | 1× NVIDIA Tesla T4, 14.5 GB VRAM |
