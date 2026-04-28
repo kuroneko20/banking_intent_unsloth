@@ -1,42 +1,13 @@
+"""
+SetFit inference cho Banking77.
+Load model đã train, predict intent từ text input.
+"""
 import json
 import os
 import yaml
-import torch
-import warnings
-import numpy as np
 import pandas as pd
+from setfit import SetFitModel
 from sklearn.metrics import accuracy_score
-from unsloth import FastLanguageModel
-
-warnings.filterwarnings("ignore")
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
-# GIỐNG HỆT train.py
-PROMPT_TEMPLATE = """### Instruction:
-Classify the banking intent. Reply with ONLY the intent label, nothing else.
-
-### Input:
-{}
-
-### Response:
-"""
-
-
-def get_embedding(model, tokenizer, text: str) -> np.ndarray:
-    """Lấy mean-pooling embedding từ hidden state cuối của model."""
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to("cuda")
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
-    # Mean pool last hidden state
-    last_hidden = outputs.hidden_states[-1]  # (1, seq_len, hidden)
-    mask = inputs["attention_mask"].unsqueeze(-1).float()
-    emb = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1)
-    return emb[0].cpu().float().numpy()
-
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
 class IntentClassification:
@@ -45,97 +16,40 @@ class IntentClassification:
             config = yaml.safe_load(f)
 
         self.checkpoint = config.get("model_checkpoint", "outputs/banking-intent-model")
-        self.max_seq_length = config.get("max_seq_length", 256)
 
+        # Load label mapping
         labels_path = os.path.join(self.checkpoint, "labels.json")
         if not os.path.exists(labels_path):
             raise FileNotFoundError(f"labels.json not found in {self.checkpoint}")
         with open(labels_path) as f:
-            self.valid_labels = json.load(f)
-        print(f"[INFO] Loaded {len(self.valid_labels)} valid labels")
+            raw = json.load(f)
+        # Support cả 2 format: {0: "label"} hoặc ["label", ...]
+        if isinstance(raw, dict):
+            self.id2label = {int(k): v for k, v in raw.items()}
+        else:
+            self.id2label = {i: v for i, v in enumerate(raw)}
+        print(f"[INFO] Loaded {len(self.id2label)} labels")
 
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.checkpoint,
-            max_seq_length=self.max_seq_length,
-            dtype=None,
-            load_in_4bit=config.get("load_in_4bit", True),
-        )
-        FastLanguageModel.for_inference(self.model)
-
-        # Pre-compute embeddings cho tất cả labels một lần
-        print("[INFO] Pre-computing label embeddings...")
-        self.label_embeddings = {}
-        for label in self.valid_labels:
-            # Embed label dưới dạng readable text: "activate my card"
-            readable = label.replace("_", " ")
-            self.label_embeddings[label] = get_embedding(self.model, self.tokenizer, readable)
-        print(f"[INFO] Done — {len(self.label_embeddings)} label embeddings ready")
-
-        unk_id = self.tokenizer.convert_tokens_to_ids("<unk>")
-        candidates = [
-            self.tokenizer.eos_token_id,
-            self.tokenizer.convert_tokens_to_ids("<|eot_id|>"),
-            self.tokenizer.convert_tokens_to_ids("<|end_of_text|>"),
-            self.tokenizer.convert_tokens_to_ids("</s>"),
-        ]
-        self.terminators = list({t for t in candidates if t is not None and t != unk_id})
-        print(f"[INFO] Stop token IDs: {self.terminators}")
-
-    def _find_best_label(self, raw: str) -> str:
-        """
-        3-bước matching:
-        1. Exact match → trả về ngay
-        2. Substring match → trả về ngay  
-        3. Semantic similarity dùng model embeddings
-        """
-        first_line = raw.strip().splitlines()[0].strip()
-        cleaned = first_line.strip(".,;:!?\"'() ").lower()
-
-        # 1. Exact match
-        for label in self.valid_labels:
-            if label.lower() == cleaned:
-                return label
-
-        # 2. Substring: label nằm trong output
-        for label in self.valid_labels:
-            if label.lower() in cleaned:
-                return label
-
-        # 3. Semantic similarity — embed raw output, tìm label gần nhất
-        raw_emb = get_embedding(self.model, self.tokenizer, first_line.replace("_", " "))
-        best_label = None
-        best_score = -1.0
-        for label, label_emb in self.label_embeddings.items():
-            score = cosine_sim(raw_emb, label_emb)
-            if score > best_score:
-                best_score = score
-                best_label = label
-
-        return best_label
+        print("[INFO] Loading SetFit model...")
+        self.model = SetFitModel.from_pretrained(self.checkpoint)
+        print("[INFO] Model ready")
 
     def __call__(self, message: str) -> str:
-        prompt = PROMPT_TEMPLATE.format(message)
-        inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
-        input_len = inputs["input_ids"].shape[1]
+        pred_id = self.model.predict([message])[0]
+        # SetFit có thể trả về label name trực tiếp hoặc integer
+        if isinstance(pred_id, str):
+            return pred_id
+        return self.id2label.get(int(pred_id), str(pred_id))
 
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=15,
-                use_cache=True,
-                eos_token_id=self.terminators,
-                pad_token_id=self.tokenizer.eos_token_id,
-                do_sample=False,
-                repetition_penalty=1.2,
-            )
-
-        new_tokens = outputs[0][input_len:]
-        raw = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        predicted = self._find_best_label(raw)
-
-        del inputs, outputs
-        torch.cuda.empty_cache()
-        return predicted
+    def predict_batch(self, messages: list) -> list:
+        preds = self.model.predict(messages)
+        results = []
+        for p in preds:
+            if isinstance(p, str):
+                results.append(p)
+            else:
+                results.append(self.id2label.get(int(p), str(p)))
+        return results
 
 
 if __name__ == "__main__":
@@ -159,15 +73,10 @@ if __name__ == "__main__":
         df_test = pd.read_csv("sample_data/test.csv")
         y_true = df_test["intent"].tolist()
         texts = df_test["text"].tolist()
-        y_pred = []
-        total = len(texts)
-        print(f"Predicting {total} samples...")
 
-        for i, text in enumerate(texts):
-            pred = classifier(message=text)
-            y_pred.append(pred)
-            if (i + 1) % 20 == 0 or (i + 1) == total:
-                print(f"  -> Processed {i+1}/{total} | last pred: '{pred}'")
+        print(f"Predicting {len(texts)} samples (batch mode)...")
+        # SetFit predict batch cùng lúc — nhanh hơn nhiều so với LLM
+        y_pred = classifier.predict_batch(texts)
 
         y_true_clean = [str(y).strip().lower() for y in y_true]
         y_pred_clean = [str(y).strip().lower() for y in y_pred]
@@ -178,9 +87,9 @@ if __name__ == "__main__":
         print("==========================================")
 
         print("\n--- DEBUG: First 10 predictions ---")
-        for i in range(min(10, total)):
+        for i in range(min(10, len(y_true))):
             mark = "✅" if y_true_clean[i] == y_pred_clean[i] else "❌"
             print(f"{mark} TRUE: '{y_true_clean[i]}' | PRED: '{y_pred_clean[i]}'")
 
     except FileNotFoundError:
-        print("Error: sample_data/test.csv not found.")
+        print("Error: sample_data/test.csv not found. Run preprocess_data.py first.")
