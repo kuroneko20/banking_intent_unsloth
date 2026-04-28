@@ -1,5 +1,5 @@
 model_name: "unsloth/llama-3-8b-Instruct-bnb-4bit"
-max_seq_length: 512        # FIX: tăng từ 256 → 512 (prompt có label list dài ~800 chars)
+max_seq_length: 648        # FIX: tăng từ 256 → 512 (prompt có label list dài ~800 chars)
 load_in_4bit: true
 
 lora_r: 32

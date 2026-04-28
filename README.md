@@ -58,8 +58,8 @@ Downloads BANKING77 from HuggingFace and samples a balanced subset for training 
  
 Expected output:
 ```
-Train: 7700 samples | 77 classes
-  samples/class: min=100, max=100, avg=100.0
+Train: 5390 samples | 77 classes
+  samples/class: min=70, max=70, avg=100.0
 Test:  385 samples | 77 classes
 Saved to sample_data/
 ```
@@ -80,7 +80,7 @@ Saved to sample_data/
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `model_name` | `unsloth/llama-3-8b-Instruct-bnb-4bit` | Base model — LLaMA 3 8B Instruct, 4-bit NF4 quantized |
-| `max_seq_length` | `512` | Maximum token length per sample. Increased from 256 to accommodate prompt with full label list (~800 chars). |
+| `max_seq_length` | `648` | Maximum token length per sample. Increased from 256 to accommodate prompt with full label list (~800 chars). |
 | `load_in_4bit` | `true` | Loads base model weights in INT4 via bitsandbytes. Reduces VRAM from ~16 GB → ~5.7 GB. |
 | `num_train_epochs` | `5` | Number of full passes over the training set. Reduced from 15 to prevent overfitting and save ~40 min on T4. |
 | `batch_size` | `4` | Per-device batch size. Combined with gradient accumulation for effective batch = 32. |

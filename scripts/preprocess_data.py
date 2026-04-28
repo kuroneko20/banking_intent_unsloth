@@ -22,7 +22,7 @@ def preprocess():
 
     # FIX: Tăng TRAIN_N lên 77 (dùng toàn bộ data gốc ~770 samples/class nếu đủ)
     # BANKING77 có ~100 train samples/class → lấy tất cả để tối đa signal
-    TRAIN_N = 100   # lấy hết (dataset gốc có 100 samples/class)
+    TRAIN_N = 70   # lấy hết (dataset gốc có 100 samples/class)
     TEST_N = 5
 
     df_train_sampled = (
