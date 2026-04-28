@@ -1,17 +1,20 @@
+# train.yaml
 model_name: "unsloth/llama-3-8b-Instruct-bnb-4bit"
-max_seq_length: 648        # FIX: tăng từ 256 → 512 (prompt có label list dài ~800 chars)
+max_seq_length: 256
 load_in_4bit: true
 
-lora_r: 32
-lora_alpha: 64
+# LoRA
+lora_r: 16
+lora_alpha: 32
 lora_dropout: 0.05
 
+# Training
 batch_size: 4
 gradient_accumulation_steps: 8
 learning_rate: 2e-4
 optimizer: "adamw_8bit"
-
-num_train_epochs: 5        # FIX: giảm từ 15 → 5 (tránh overfit, tiết kiệm ~40 phút)
+lr_scheduler_type: "cosine"
+num_train_epochs: 10          # ~85 phút — nằm chắc trong 1h30
 
 output_dir: "outputs/banking-intent-model"
 train_data_path: "sample_data/train.csv"

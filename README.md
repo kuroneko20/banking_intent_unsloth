@@ -1,11 +1,11 @@
 # Banking Intent Classification with Unsloth + LLaMA 3
- 
+
 Fine-tune LLaMA 3 8B Instruct on the [BANKING77](https://huggingface.co/datasets/mteb/banking77) dataset using LoRA adapters via [Unsloth](https://github.com/unslothai/unsloth) for 2x faster training on a single GPU.
- 
+
 ---
- 
+
 ## Project Structure
- 
+
 ```
 banking_intent_unsloth/
 ├── configs/
@@ -23,149 +23,181 @@ banking_intent_unsloth/
 ├── inference.sh
 └── requirements.txt
 ```
- 
+
 ---
- 
+
 ## Quickstart — Google Colab
- 
+
 > Requires a **T4 GPU** runtime. Go to `Runtime → Change runtime type → T4 GPU` before running.
- 
+
 ### Step 1 — Clone the repository
- 
+
 ```python
 !git clone https://github.com/kuroneko20/banking_intent_unsloth.git
 ```
- 
+
 ### Step 2 — Navigate to project directory
- 
+
 ```python
 %cd banking_intent_unsloth
 ```
- 
+
 ### Step 3 — Install dependencies
- 
+
 ```python
 !pip install -r requirements.txt
 ```
- 
+
 ### Step 4 — Preprocess data
- 
+
 Downloads BANKING77 from HuggingFace and samples a balanced subset for training and testing.
- 
+
 ```python
 !python scripts/preprocess_data.py
 ```
- 
+
 Expected output:
 ```
-Train: 5306 samples | 77 classes
-  samples/class: min=35, max=70, avg=68.9
-Test:  385 samples | 77 classes
+Train: 3850 samples across 77 classes
+  samples/class: min=50, max=50
+Test:  385 samples across 77 classes
 Saved to sample_data/
 ```
- 
+
 ### Step 5 — Train & run inference
- 
+
 ```python
 !bash train.sh
 !bash inference.sh
 ```
- 
+
 ---
- 
+
+## Prompt Format
+
+Both `train.py` and `inference.py` use the same prompt template:
+
+```
+### Instruction:
+Classify the banking intent. Reply with ONLY the intent label, nothing else.
+
+### Input:
+{customer_message}
+
+### Response:
+{intent_label}
+```
+
+During training, `{intent_label}` is filled with the ground-truth label followed by the EOS token. During inference, the `### Response:` section is left empty and the model generates the label.
+
+---
+
 ## Hyperparameters
- 
+
 ### Training (`configs/train.yaml`)
- 
+
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `model_name` | `unsloth/llama-3-8b-Instruct-bnb-4bit` | Base model — LLaMA 3 8B Instruct, 4-bit NF4 quantized |
-| `max_seq_length` | `648` | Maximum token length per sample. Increased from 256 to accommodate prompt with full label list (~800 chars). |
+| `max_seq_length` | `256` | Maximum token length per sample. Covers the prompt template + longest intent label with margin. |
 | `load_in_4bit` | `true` | Loads base model weights in INT4 via bitsandbytes. Reduces VRAM from ~16 GB → ~5.7 GB. |
-| `num_train_epochs` | `5` | Number of full passes over the training set. Reduced from 15 to prevent overfitting and save ~40 min on T4. |
+| `num_train_epochs` | `10` | Number of full passes over the training set. |
 | `batch_size` | `4` | Per-device batch size. Combined with gradient accumulation for effective batch = 32. |
 | `gradient_accumulation_steps` | `8` | Accumulates gradients over 8 steps before each optimizer update. Effective batch size = 4 × 8 = **32**. |
 | `learning_rate` | `2e-4` | Peak learning rate for AdamW. Higher than full fine-tuning because LoRA adapters start from zero. |
 | `optimizer` | `adamw_8bit` | 8-bit AdamW — same update rule as standard AdamW but optimizer states stored in INT8 (~75% memory reduction). |
-| `lr_scheduler_type` | `cosine` | Cosine decay from peak LR to near-zero over all training steps. Stable convergence with no mid-training spikes. |
-| `warmup_steps` | `~90` (5% of total steps) | Linear warmup from 0 → peak LR. Prevents gradient explosion at the start of training. Computed dynamically as `max(10, int(total_steps * 0.05))`. |
- 
+| `lr_scheduler_type` | `cosine_with_restarts` | Cosine decay with 3 hard restarts (`num_cycles=3`). Helps escape local minima during longer training runs. |
+| `warmup_steps` | `~24` (5% of total steps) | Linear warmup from 0 → peak LR. Computed dynamically as `max(10, int(total_steps * 0.05))`. |
+
 ### LoRA Adapter (`configs/train.yaml`)
- 
+
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `lora_r` | `32` | Rank of LoRA adapter matrices. Controls capacity — 32 gives higher expressiveness for 77-class classification. |
-| `lora_alpha` | `64` | LoRA scaling factor. Kept at 2× rank (standard practice). Effective scale = alpha / r = 2.0. |
-| `lora_dropout` | `0.05` | Randomly zeros 5% of adapter activations per forward pass. Prevents overfitting on small class sizes (100 samples/class). |
+| `lora_r` | `16` | Rank of LoRA adapter matrices. Controls capacity — sufficient for 77-class intent classification. |
+| `lora_alpha` | `32` | LoRA scaling factor. Kept at 2× rank (standard practice). Effective scale = alpha / r = 2.0. |
+| `lora_dropout` | `0.05` | Randomly zeros 5% of adapter activations per forward pass. Prevents overfitting on small class sizes (50 samples/class). |
 | `target_modules` | `q, k, v, o, gate, up, down` | All attention projections + MLP layers. Full coverage gives better task adaptation than attention-only. |
 | `bias` | `none` | No bias terms added to adapters — standard for LoRA. |
 | `gradient_checkpointing` | `unsloth` | Recomputes activations during backward pass instead of storing them. Saves ~30% VRAM at a small compute cost. |
- 
-### Regularization & Augmentation
- 
+
+### Regularization
+
 | Technique | Value | Notes |
 |-----------|-------|-------|
 | Weight decay | `0.01` | L2 regularization on non-bias weights via AdamW. Prevents adapter weights from growing too large. |
 | LoRA dropout | `0.05` | Applied to adapter activations each forward pass. Main regularizer for small-data regime. |
 | Training shuffle | `random_state=42` | Dataset shuffled before training to prevent model seeing consecutive same-class samples. |
 | 4-bit quantization | NF4 (implicit) | Base model quantization adds implicit noise to frozen backbone — mild regularization effect. |
-| Data augmentation | None | No text augmentation applied. Potential improvement if accuracy plateaus: synonym replacement or back-translation. |
 | Label smoothing | None | Not applied. Can be added via `label_smoothing_factor=0.1` in `TrainingArguments` if overfitting is observed. |
- 
+
 ### Expected Training Behaviour
- 
+
 ```
 Epoch  1–2:  loss ~3.0–4.0   (model learning label format)
-Epoch  3–4:  loss ~1.0–2.0   (rapid convergence)
-Epoch  5:    loss ~0.2–0.5   (target range: < 0.3)
+Epoch  3–5:  loss ~1.0–2.0   (rapid convergence)
+Epoch  6–10: loss ~0.2–0.5   (target range: < 0.3)
 ```
- 
-> If loss is still above 0.5 at epoch 4, try reducing `learning_rate` to `1e-4` or increasing `num_train_epochs` to `8`.
- 
+
+> If loss is still above 0.5 at epoch 6, try reducing `learning_rate` to `1e-4` or increasing `num_train_epochs` to `15`.
+
 ---
- 
+
 ## Inference
- 
-Inference uses **log-probability scoring** instead of generative decoding. For each input message, the classifier scores every valid label by computing the average log-probability of the label tokens appended to the prompt (teacher forcing), then picks the label with the highest score.
 
-This approach:
-- **Guarantees** the output is always a valid label — no fuzzy matching or post-processing needed
-- Uses the model's true signal (token probabilities) rather than string similarity heuristics
-- Is more robust than greedy decoding for constrained classification tasks
+Inference uses **greedy decoding** followed by a **4-step fuzzy matching pipeline** to guarantee a valid label is always returned.
 
+### Decoding
+
+The model generates up to 20 new tokens with greedy decoding (`do_sample=False`) and a mild `repetition_penalty=1.1` to avoid the model repeating tokens from the prompt.
+
+```python
+outputs = model.generate(
+    **inputs,
+    max_new_tokens=20,
+    do_sample=False,
+    repetition_penalty=1.1,
+    eos_token_id=terminators,
+)
 ```
-For each label in valid_labels:
-    score = avg log-prob of label tokens | prompt
-Pick label with highest score
-```
+
+### Label Matching Pipeline
+
+Because greedy decoding can produce minor formatting variations (extra whitespace, punctuation, slight rewording), the raw output is cleaned and matched against `labels.json` through 4 ordered steps:
+
+| Step | Method | Triggers when |
+|------|--------|---------------|
+| 1 | **Exact match** (after normalize: lowercase + strip punctuation + spaces → underscores) | Output matches a label exactly |
+| 2 | **Substring match** | Label string is contained in output, or output is contained in label string |
+| 3 | **Token overlap** (Jaccard ≥ 0.4) | Output shares enough word tokens with a label |
+| 4 | **SequenceMatcher** (edit distance fallback) | Always fires — picks the label with the highest character-level similarity ratio |
+
+This pipeline ensures every prediction is a member of `valid_labels` regardless of what the model generates.
 
 ### Inference config (`configs/inference.yaml`)
- 
+
 | Parameter | Value |
 |-----------|-------|
 | `model_checkpoint` | `outputs/banking-intent-model` |
 | `max_seq_length` | `256` |
 | `load_in_4bit` | `true` |
- 
+
 ---
- 
+
 ## Model & Data Summary
- 
+
 | | |
 |---|---|
 | **Base model** | LLaMA 3 8B Instruct (4-bit NF4 quantized) |
 | **Dataset** | BANKING77 — 77 intent classes |
-| **Train set** | 5,306 samples (68.9 per class) |
+| **Train set** | 3,850 samples (50 per class) |
 | **Test set** | 385 samples (5 per class) |
-| **Trainable parameters** | ~42M of 8.07B (0.52%) |
+| **Trainable parameters** | ~21M of 8.07B (~0.26%) |
 | **Hardware** | 1× NVIDIA Tesla T4, 14.5 GB VRAM |
-| **Estimated train time** | ~45–55 min at 5 epochs |
+| **Estimated train time** | ~60–80 min at 10 epochs on T4 |
 | **Target accuracy** | 60–75% on test set |
- 
+
 ---
 
-
- 
 ## Video demo
- 
+
 - Link: https://drive.google.com/drive/u/0/folders/1GDlAFhq7QpFwRMBdeGACXDQPxs1SdKs3
