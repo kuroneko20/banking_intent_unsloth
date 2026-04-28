@@ -1,3 +1,5 @@
+import json
+import os
 import yaml
 import pandas as pd
 from datasets import Dataset
@@ -6,25 +8,20 @@ from trl import SFTTrainer
 from transformers import TrainingArguments
 
 # ============================================================
-# FIX 1: Prompt mới — liệt kê label hợp lệ ngay trong instruction
-# Giúp model học được "danh sách nhãn" thay vì tự bịa
+# Prompt NGẮN GỌN — không nhét 77 labels vào
+# max_seq_length=256 chỉ chứa được ~200 tokens prompt
+# Toàn bộ sample (prompt + label) phải < 256 tokens
 # ============================================================
-def build_prompt_template(all_labels: list[str]) -> str:
-    label_list_str = "\n".join(f"- {l}" for l in sorted(all_labels))
-    return (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n"
-        "Classify the banking intent of the following input text.\n"
-        "Output ONLY one exact intent label from the list below and nothing else. "
-        "Do NOT add any explanation, punctuation, or extra words.\n\n"
-        "Valid intent labels:\n"
-        f"{label_list_str}\n\n"
-        "### Input:\n"
-        "{input}\n\n"
-        "### Response:\n"
-        "{response}"
-    )
+PROMPT_TEMPLATE = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Classify the banking intent of the following input text. Output ONLY the exact intent label and nothing else.
+
+### Input:
+{}
+
+### Response:
+{}"""
 
 
 def load_config(config_path="configs/train.yaml"):
@@ -35,17 +32,15 @@ def load_config(config_path="configs/train.yaml"):
 def main():
     config = load_config()
 
-    print("Loading Data first to build label list...")
+    print("Loading Data...")
     train_df = pd.read_csv(config["train_data_path"])
     all_labels = sorted(train_df["intent"].unique().tolist())
-    print(f"  -> Found {len(all_labels)} unique intents")
+    print(f"  -> {len(all_labels)} unique intents, {len(train_df)} samples")
 
-    prompt_template = build_prompt_template(all_labels)
-
-    # Lưu label list ra file để inference dùng lại
-    import json, os
-    os.makedirs(config.get("output_dir", "outputs/banking-intent-model"), exist_ok=True)
-    labels_path = os.path.join(config.get("output_dir", "outputs/banking-intent-model"), "labels.json")
+    # Lưu label list để inference dùng fuzzy match
+    output_dir = config.get("output_dir", "outputs/banking-intent-model")
+    os.makedirs(output_dir, exist_ok=True)
+    labels_path = os.path.join(output_dir, "labels.json")
     with open(labels_path, "w") as f:
         json.dump(all_labels, f, indent=2)
     print(f"  -> Labels saved to {labels_path}")
@@ -60,10 +55,10 @@ def main():
 
     model = FastLanguageModel.get_peft_model(
         model,
-        # FIX 2: Tăng r và lora_alpha để model có capacity học 77 classes
-        r=config.get("lora_r", 32),
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=config.get("lora_alpha", 64),
+        r=config.get("lora_r", 16),
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=config.get("lora_alpha", 32),
         lora_dropout=config.get("lora_dropout", 0.05),
         bias="none",
         use_gradient_checkpointing="unsloth",
@@ -75,11 +70,23 @@ def main():
     def format_prompts(examples):
         texts = []
         for text, intent in zip(examples["text"], examples["intent"]):
-            formatted = prompt_template.format(input=text, response=intent) + tokenizer.eos_token
+            formatted = PROMPT_TEMPLATE.format(text, intent) + tokenizer.eos_token
             texts.append(formatted)
         return {"formatted_text": texts}
 
     train_dataset = train_dataset.map(format_prompts, batched=True)
+
+    # Kiểm tra độ dài token thực tế của 5 mẫu đầu
+    sample_lengths = []
+    for t in train_dataset["formatted_text"][:5]:
+        toks = tokenizer(t, return_tensors="pt")
+        sample_lengths.append(toks["input_ids"].shape[1])
+    print(f"  -> Sample token lengths (first 5): {sample_lengths}")
+    print(f"  -> max_seq_length = {config['max_seq_length']}")
+    if max(sample_lengths) > config["max_seq_length"]:
+        print("  ⚠️  WARNING: Some samples exceed max_seq_length — sẽ bị truncate!")
+    else:
+        print("  ✅ Token lengths OK")
 
     print("Initializing Trainer...")
     trainer = SFTTrainer(
@@ -93,7 +100,6 @@ def main():
             per_device_train_batch_size=config.get("batch_size", 4),
             gradient_accumulation_steps=config.get("gradient_accumulation_steps", 4),
             warmup_steps=10,
-            # FIX 3: Tăng epochs — 77 classes với 20 samples/class cần ít nhất 5 epochs
             num_train_epochs=config.get("num_train_epochs", 5),
             learning_rate=float(config.get("learning_rate", 2e-4)),
             fp16=not is_bfloat16_supported(),
@@ -101,7 +107,7 @@ def main():
             logging_steps=10,
             optim=config.get("optimizer", "adamw_8bit"),
             weight_decay=0.01,
-            lr_scheduler_type="cosine",  # FIX 4: cosine decay tốt hơn linear cho fine-tune
+            lr_scheduler_type="cosine",
             seed=42,
             output_dir="outputs",
         ),
@@ -110,9 +116,9 @@ def main():
     print("Training...")
     trainer.train()
 
-    print(f"Saving model to {config['output_dir']}...")
-    model.save_pretrained(config["output_dir"])
-    tokenizer.save_pretrained(config["output_dir"])
+    print(f"Saving model to {output_dir}...")
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     print("Done!")
 
 
