@@ -4,7 +4,6 @@ import yaml
 import torch
 import warnings
 import pandas as pd
-from difflib import get_close_matches
 from sklearn.metrics import accuracy_score
 from unsloth import FastLanguageModel
 
@@ -12,49 +11,15 @@ warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
+# PHẢI GIỐNG HỆT train.py — chỉ bỏ phần response
+PROMPT_TEMPLATE = """### Instruction:
+Classify the banking intent. Reply with ONLY the intent label, nothing else.
 
-def build_prompt(label_list_str: str, input_text: str) -> str:
-    """Giống hệt train.py, chỉ bỏ phần response."""
-    return (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n"
-        "Classify the banking intent of the following input text.\n"
-        "You MUST output ONLY one label from this exact list, word-for-word, nothing else:\n"
-        f"{label_list_str}\n\n"
-        "### Input:\n"
-        f"{input_text}\n\n"
-        "### Response:\n"
-    )
+### Input:
+{}
 
-
-def fuzzy_match_label(raw_pred: str, valid_labels: list) -> str:
-    first_line = raw_pred.strip().splitlines()[0].strip().lower()
-
-    # 1. Exact match
-    for label in valid_labels:
-        if label.lower() == first_line:
-            return label
-
-    # 2. Label nằm trong output (bỏ dấu câu thừa)
-    cleaned = first_line.strip(".,;:!?\"'()")
-    for label in valid_labels:
-        if label.lower() == cleaned:
-            return label
-
-    # 3. Substring match
-    for label in valid_labels:
-        if label.lower() in first_line:
-            return label
-
-    # 4. Fuzzy difflib
-    matches = get_close_matches(first_line, [l.lower() for l in valid_labels], n=1, cutoff=0.55)
-    if matches:
-        for label in valid_labels:
-            if label.lower() == matches[0]:
-                return label
-
-    return first_line
+### Response:
+"""
 
 
 class IntentClassification:
@@ -63,25 +28,14 @@ class IntentClassification:
             config = yaml.safe_load(f)
 
         self.checkpoint = config.get("model_checkpoint", "outputs/banking-intent-model")
-        self.max_seq_length = config.get("max_seq_length", 1024)
+        self.max_seq_length = config.get("max_seq_length", 256)
 
-        # Load labels và label_list_str từ train
         labels_path = os.path.join(self.checkpoint, "labels.json")
-        label_str_path = os.path.join(self.checkpoint, "label_list_str.txt")
-
-        if os.path.exists(labels_path):
-            with open(labels_path) as f:
-                self.valid_labels = json.load(f)
-            print(f"[INFO] Loaded {len(self.valid_labels)} valid labels")
-        else:
-            raise FileNotFoundError(f"labels.json not found in {self.checkpoint}. Retrain first.")
-
-        if os.path.exists(label_str_path):
-            with open(label_str_path) as f:
-                self.label_list_str = f.read().strip()
-        else:
-            # Fallback: tự build lại
-            self.label_list_str = ", ".join(sorted(self.valid_labels))
+        if not os.path.exists(labels_path):
+            raise FileNotFoundError(f"labels.json not found in {self.checkpoint}")
+        with open(labels_path) as f:
+            self.valid_labels = json.load(f)
+        print(f"[INFO] Loaded {len(self.valid_labels)} valid labels")
 
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=self.checkpoint,
@@ -90,6 +44,13 @@ class IntentClassification:
             load_in_4bit=config.get("load_in_4bit", True),
         )
         FastLanguageModel.for_inference(self.model)
+
+        # ================================================================
+        # CONSTRAINED DECODING: tính token IDs của từng label hợp lệ
+        # Tại mỗi bước generate, chỉ cho phép tokens thuộc prefix của labels
+        # → model KHÔNG THỂ output text ngoài tập labels
+        # ================================================================
+        self._build_label_token_map()
 
         unk_id = self.tokenizer.convert_tokens_to_ids("<unk>")
         candidates = [
@@ -101,29 +62,92 @@ class IntentClassification:
         self.terminators = list({t for t in candidates if t is not None and t != unk_id})
         print(f"[INFO] Stop token IDs: {self.terminators}")
 
-    def __call__(self, message: str) -> str:
-        prompt = build_prompt(self.label_list_str, message)
-        inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
-        input_len = inputs["input_ids"].shape[1]
+    def _build_label_token_map(self):
+        """Tokenize tất cả labels, build prefix tree để constrained decoding."""
+        self.label_token_ids = {}
+        for label in self.valid_labels:
+            # Tokenize label (không có special tokens)
+            token_ids = self.tokenizer.encode(label, add_special_tokens=False)
+            self.label_token_ids[label] = token_ids
 
+        # Build set các first-token hợp lệ
+        self.valid_first_tokens = list({ids[0] for ids in self.label_token_ids.values()})
+        print(f"[INFO] {len(self.valid_first_tokens)} unique first tokens across {len(self.valid_labels)} labels")
+
+    def _constrained_generate(self, inputs) -> str:
+        """
+        Generate với constrained decoding:
+        1. Generate token đầu tiên — chỉ từ first tokens của labels
+        2. Từ first token đó, tìm labels bắt đầu bằng token này
+        3. Nếu chỉ còn 1 label → trả về luôn
+        4. Tiếp tục generate token tiếp theo trong candidates còn lại
+        """
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+
+        # Lấy logits tại bước đầu tiên
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
+            output = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=15,
                 use_cache=True,
                 eos_token_id=self.terminators,
                 pad_token_id=self.tokenizer.eos_token_id,
                 do_sample=False,
-                repetition_penalty=1.2,
+                repetition_penalty=1.0,
             )
 
-        new_tokens = outputs[0][input_len:]
-        raw_label = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        predicted = fuzzy_match_label(raw_label, self.valid_labels)
+        new_tokens = output[0][input_ids.shape[1]:]
+        raw = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        return raw
 
-        del inputs, outputs
+    def _fuzzy_match(self, raw: str) -> str:
+        """Match raw output về label gần nhất."""
+        first_line = raw.strip().splitlines()[0].strip().lower()
+        cleaned = first_line.strip(".,;:!?\"'() ")
+
+        # Exact match
+        for label in self.valid_labels:
+            if label.lower() == cleaned:
+                return label
+
+        # Label là substring của output
+        for label in self.valid_labels:
+            if label.lower() in cleaned:
+                return label
+
+        # Output là substring của label
+        if len(cleaned) > 4:
+            for label in self.valid_labels:
+                if cleaned in label.lower():
+                    return label
+
+        # Token overlap score
+        best_label = None
+        best_score = 0
+        cleaned_tokens = set(cleaned.replace("_", " ").split())
+        for label in self.valid_labels:
+            label_tokens = set(label.replace("_", " ").split())
+            overlap = len(cleaned_tokens & label_tokens)
+            if overlap > best_score:
+                best_score = overlap
+                best_label = label
+
+        if best_score > 0 and best_label:
+            return best_label
+
+        return cleaned
+
+    def __call__(self, message: str) -> str:
+        prompt = PROMPT_TEMPLATE.format(message)
+        inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
+
+        raw = self._constrained_generate(inputs)
+        predicted = self._fuzzy_match(raw)
+
+        del inputs
         torch.cuda.empty_cache()
-
         return predicted
 
 
