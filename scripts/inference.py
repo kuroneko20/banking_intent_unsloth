@@ -3,6 +3,7 @@ import os
 import yaml
 import torch
 import warnings
+import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score
 from unsloth import FastLanguageModel
@@ -11,7 +12,7 @@ warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# PHẢI GIỐNG HỆT train.py — chỉ bỏ phần response
+# GIỐNG HỆT train.py
 PROMPT_TEMPLATE = """### Instruction:
 Classify the banking intent. Reply with ONLY the intent label, nothing else.
 
@@ -20,6 +21,22 @@ Classify the banking intent. Reply with ONLY the intent label, nothing else.
 
 ### Response:
 """
+
+
+def get_embedding(model, tokenizer, text: str) -> np.ndarray:
+    """Lấy mean-pooling embedding từ hidden state cuối của model."""
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to("cuda")
+    with torch.no_grad():
+        outputs = model(**inputs, output_hidden_states=True)
+    # Mean pool last hidden state
+    last_hidden = outputs.hidden_states[-1]  # (1, seq_len, hidden)
+    mask = inputs["attention_mask"].unsqueeze(-1).float()
+    emb = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1)
+    return emb[0].cpu().float().numpy()
+
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
 class IntentClassification:
@@ -45,12 +62,14 @@ class IntentClassification:
         )
         FastLanguageModel.for_inference(self.model)
 
-        # ================================================================
-        # CONSTRAINED DECODING: tính token IDs của từng label hợp lệ
-        # Tại mỗi bước generate, chỉ cho phép tokens thuộc prefix của labels
-        # → model KHÔNG THỂ output text ngoài tập labels
-        # ================================================================
-        self._build_label_token_map()
+        # Pre-compute embeddings cho tất cả labels một lần
+        print("[INFO] Pre-computing label embeddings...")
+        self.label_embeddings = {}
+        for label in self.valid_labels:
+            # Embed label dưới dạng readable text: "activate my card"
+            readable = label.replace("_", " ")
+            self.label_embeddings[label] = get_embedding(self.model, self.tokenizer, readable)
+        print(f"[INFO] Done — {len(self.label_embeddings)} label embeddings ready")
 
         unk_id = self.tokenizer.convert_tokens_to_ids("<unk>")
         candidates = [
@@ -62,91 +81,59 @@ class IntentClassification:
         self.terminators = list({t for t in candidates if t is not None and t != unk_id})
         print(f"[INFO] Stop token IDs: {self.terminators}")
 
-    def _build_label_token_map(self):
-        """Tokenize tất cả labels, build prefix tree để constrained decoding."""
-        self.label_token_ids = {}
+    def _find_best_label(self, raw: str) -> str:
+        """
+        3-bước matching:
+        1. Exact match → trả về ngay
+        2. Substring match → trả về ngay  
+        3. Semantic similarity dùng model embeddings
+        """
+        first_line = raw.strip().splitlines()[0].strip()
+        cleaned = first_line.strip(".,;:!?\"'() ").lower()
+
+        # 1. Exact match
         for label in self.valid_labels:
-            # Tokenize label (không có special tokens)
-            token_ids = self.tokenizer.encode(label, add_special_tokens=False)
-            self.label_token_ids[label] = token_ids
+            if label.lower() == cleaned:
+                return label
 
-        # Build set các first-token hợp lệ
-        self.valid_first_tokens = list({ids[0] for ids in self.label_token_ids.values()})
-        print(f"[INFO] {len(self.valid_first_tokens)} unique first tokens across {len(self.valid_labels)} labels")
+        # 2. Substring: label nằm trong output
+        for label in self.valid_labels:
+            if label.lower() in cleaned:
+                return label
 
-    def _constrained_generate(self, inputs) -> str:
-        """
-        Generate với constrained decoding:
-        1. Generate token đầu tiên — chỉ từ first tokens của labels
-        2. Từ first token đó, tìm labels bắt đầu bằng token này
-        3. Nếu chỉ còn 1 label → trả về luôn
-        4. Tiếp tục generate token tiếp theo trong candidates còn lại
-        """
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
+        # 3. Semantic similarity — embed raw output, tìm label gần nhất
+        raw_emb = get_embedding(self.model, self.tokenizer, first_line.replace("_", " "))
+        best_label = None
+        best_score = -1.0
+        for label, label_emb in self.label_embeddings.items():
+            score = cosine_sim(raw_emb, label_emb)
+            if score > best_score:
+                best_score = score
+                best_label = label
 
-        # Lấy logits tại bước đầu tiên
+        return best_label
+
+    def __call__(self, message: str) -> str:
+        prompt = PROMPT_TEMPLATE.format(message)
+        inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
+        input_len = inputs["input_ids"].shape[1]
+
         with torch.no_grad():
-            output = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+            outputs = self.model.generate(
+                **inputs,
                 max_new_tokens=15,
                 use_cache=True,
                 eos_token_id=self.terminators,
                 pad_token_id=self.tokenizer.eos_token_id,
                 do_sample=False,
-                repetition_penalty=1.0,
+                repetition_penalty=1.2,
             )
 
-        new_tokens = output[0][input_ids.shape[1]:]
+        new_tokens = outputs[0][input_len:]
         raw = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        return raw
+        predicted = self._find_best_label(raw)
 
-    def _fuzzy_match(self, raw: str) -> str:
-        """Match raw output về label gần nhất."""
-        first_line = raw.strip().splitlines()[0].strip().lower()
-        cleaned = first_line.strip(".,;:!?\"'() ")
-
-        # Exact match
-        for label in self.valid_labels:
-            if label.lower() == cleaned:
-                return label
-
-        # Label là substring của output
-        for label in self.valid_labels:
-            if label.lower() in cleaned:
-                return label
-
-        # Output là substring của label
-        if len(cleaned) > 4:
-            for label in self.valid_labels:
-                if cleaned in label.lower():
-                    return label
-
-        # Token overlap score
-        best_label = None
-        best_score = 0
-        cleaned_tokens = set(cleaned.replace("_", " ").split())
-        for label in self.valid_labels:
-            label_tokens = set(label.replace("_", " ").split())
-            overlap = len(cleaned_tokens & label_tokens)
-            if overlap > best_score:
-                best_score = overlap
-                best_label = label
-
-        if best_score > 0 and best_label:
-            return best_label
-
-        return cleaned
-
-    def __call__(self, message: str) -> str:
-        prompt = PROMPT_TEMPLATE.format(message)
-        inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
-
-        raw = self._constrained_generate(inputs)
-        predicted = self._fuzzy_match(raw)
-
-        del inputs
+        del inputs, outputs
         torch.cuda.empty_cache()
         return predicted
 
@@ -196,4 +183,4 @@ if __name__ == "__main__":
             print(f"{mark} TRUE: '{y_true_clean[i]}' | PRED: '{y_pred_clean[i]}'")
 
     except FileNotFoundError:
-        print("Error: sample_data/test.csv not found. Run preprocess_data.py first.")
+        print("Error: sample_data/test.csv not found.")
