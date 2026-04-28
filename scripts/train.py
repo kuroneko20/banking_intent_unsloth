@@ -7,21 +7,24 @@ from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl import SFTTrainer
 from transformers import TrainingArguments
 
-# ============================================================
-# Prompt NGẮN GỌN — không nhét 77 labels vào
-# max_seq_length=256 chỉ chứa được ~200 tokens prompt
-# Toàn bộ sample (prompt + label) phải < 256 tokens
-# ============================================================
-PROMPT_TEMPLATE = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-### Instruction:
-Classify the banking intent of the following input text. Output ONLY the exact intent label and nothing else.
-
-### Input:
-{}
-
-### Response:
-{}"""
+def build_prompt(label_list_str: str, input_text: str, response: str = "") -> str:
+    """
+    Prompt nhét label list dạng comma-separated (ngắn hơn bullet list ~40%).
+    Tổng ~700 tokens — an toàn với max_seq_length=1024.
+    """
+    return (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n"
+        "Classify the banking intent of the following input text.\n"
+        "You MUST output ONLY one label from this exact list, word-for-word, nothing else:\n"
+        f"{label_list_str}\n\n"
+        "### Input:\n"
+        f"{input_text}\n\n"
+        "### Response:\n"
+        f"{response}"
+    )
 
 
 def load_config(config_path="configs/train.yaml"):
@@ -32,18 +35,25 @@ def load_config(config_path="configs/train.yaml"):
 def main():
     config = load_config()
 
+    # Bắt buộc max_seq_length >= 1024 để chứa prompt + label
+    if config.get("max_seq_length", 256) < 1024:
+        print("⚠️  WARNING: max_seq_length < 1024 — label list sẽ bị truncate!")
+        print("   Hãy set max_seq_length: 1024 trong configs/train.yaml")
+
     print("Loading Data...")
     train_df = pd.read_csv(config["train_data_path"])
     all_labels = sorted(train_df["intent"].unique().tolist())
+    label_list_str = ", ".join(all_labels)  # comma-separated, ngắn gọn
     print(f"  -> {len(all_labels)} unique intents, {len(train_df)} samples")
 
-    # Lưu label list để inference dùng fuzzy match
+    # Lưu labels + label_list_str để inference dùng lại
     output_dir = config.get("output_dir", "outputs/banking-intent-model")
     os.makedirs(output_dir, exist_ok=True)
-    labels_path = os.path.join(output_dir, "labels.json")
-    with open(labels_path, "w") as f:
+    with open(os.path.join(output_dir, "labels.json"), "w") as f:
         json.dump(all_labels, f, indent=2)
-    print(f"  -> Labels saved to {labels_path}")
+    with open(os.path.join(output_dir, "label_list_str.txt"), "w") as f:
+        f.write(label_list_str)
+    print(f"  -> Labels saved to {output_dir}/labels.json")
 
     print("Loading Model...")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -70,23 +80,24 @@ def main():
     def format_prompts(examples):
         texts = []
         for text, intent in zip(examples["text"], examples["intent"]):
-            formatted = PROMPT_TEMPLATE.format(text, intent) + tokenizer.eos_token
+            formatted = build_prompt(label_list_str, text, intent) + tokenizer.eos_token
             texts.append(formatted)
         return {"formatted_text": texts}
 
     train_dataset = train_dataset.map(format_prompts, batched=True)
 
-    # Kiểm tra độ dài token thực tế của 5 mẫu đầu
-    sample_lengths = []
-    for t in train_dataset["formatted_text"][:5]:
-        toks = tokenizer(t, return_tensors="pt")
-        sample_lengths.append(toks["input_ids"].shape[1])
-    print(f"  -> Sample token lengths (first 5): {sample_lengths}")
-    print(f"  -> max_seq_length = {config['max_seq_length']}")
+    # Kiểm tra token length thực tế
+    sample_lengths = [
+        tokenizer(t, return_tensors="pt")["input_ids"].shape[1]
+        for t in train_dataset["formatted_text"][:5]
+    ]
+    print(f"  -> Token lengths (5 samples): {sample_lengths}")
     if max(sample_lengths) > config["max_seq_length"]:
-        print("  ⚠️  WARNING: Some samples exceed max_seq_length — sẽ bị truncate!")
+        print(f"  ❌ TRUNCATION DETECTED! Max sample={max(sample_lengths)} > max_seq_length={config['max_seq_length']}")
+        print("     Set max_seq_length: 1024 in train.yaml and retrain!")
+        return
     else:
-        print("  ✅ Token lengths OK")
+        print(f"  ✅ All samples fit within max_seq_length={config['max_seq_length']}")
 
     print("Initializing Trainer...")
     trainer = SFTTrainer(
@@ -97,8 +108,8 @@ def main():
         max_seq_length=config["max_seq_length"],
         dataset_num_proc=2,
         args=TrainingArguments(
-            per_device_train_batch_size=config.get("batch_size", 4),
-            gradient_accumulation_steps=config.get("gradient_accumulation_steps", 4),
+            per_device_train_batch_size=config.get("batch_size", 2),  # batch kéo nhỏ vì seq dài hơn
+            gradient_accumulation_steps=config.get("gradient_accumulation_steps", 8),
             warmup_steps=10,
             num_train_epochs=config.get("num_train_epochs", 5),
             learning_rate=float(config.get("learning_rate", 2e-4)),

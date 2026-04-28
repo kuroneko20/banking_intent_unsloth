@@ -1,11 +1,11 @@
 model_name: "unsloth/llama-3-8b-Instruct-bnb-4bit" # Base model lượng tử hóa 4-bit
-max_seq_length: 256 # Chiều dài chuỗi tối đa
+max_seq_length: 1024 # Chiều dài chuỗi tối đa
 load_in_4bit: true
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0
-batch_size: 4 # Batch size nhỏ để tránh OOM trên Colab
-gradient_accumulation_steps: 4 # Tăng batch size ảo
+batch_size: 2 # Batch size nhỏ để tránh OOM trên Colab
+gradient_accumulation_steps: 8 # Tăng batch size ảo
 learning_rate: 2.0e-4 # Learning rate chuẩn cho LoRA
 optimizer: "adamw_8bit" # Optimizer tiết kiệm bộ nhớ
 num_train_epochs: 5 # Epochs (rút ngắn để demo)

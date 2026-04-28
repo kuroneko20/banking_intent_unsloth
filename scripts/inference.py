@@ -12,25 +12,23 @@ warnings.filterwarnings("ignore")
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Prompt PHẢI GIỐNG HỆT train.py — chỉ khác phần Response (bỏ trống)
-PROMPT_TEMPLATE = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-### Instruction:
-Classify the banking intent of the following input text. Output ONLY the exact intent label and nothing else.
+def build_prompt(label_list_str: str, input_text: str) -> str:
+    """Giống hệt train.py, chỉ bỏ phần response."""
+    return (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n"
+        "Classify the banking intent of the following input text.\n"
+        "You MUST output ONLY one label from this exact list, word-for-word, nothing else:\n"
+        f"{label_list_str}\n\n"
+        "### Input:\n"
+        f"{input_text}\n\n"
+        "### Response:\n"
+    )
 
-### Input:
-{}
 
-### Response:
-"""
-
-
-def fuzzy_match_label(raw_pred: str, valid_labels: list[str]) -> str:
-    """
-    Map output của model về label hợp lệ gần nhất.
-    Thứ tự ưu tiên: exact → first-line exact → substring → difflib fuzzy
-    """
-    # Lấy dòng đầu tiên, bỏ text rác sau newline
+def fuzzy_match_label(raw_pred: str, valid_labels: list) -> str:
     first_line = raw_pred.strip().splitlines()[0].strip().lower()
 
     # 1. Exact match
@@ -38,14 +36,15 @@ def fuzzy_match_label(raw_pred: str, valid_labels: list[str]) -> str:
         if label.lower() == first_line:
             return label
 
-    # 2. Substring: label nằm trong output (vd: "lost_or_stolen_card." → "lost_or_stolen_card")
+    # 2. Label nằm trong output (bỏ dấu câu thừa)
+    cleaned = first_line.strip(".,;:!?\"'()")
     for label in valid_labels:
-        if label.lower() in first_line:
+        if label.lower() == cleaned:
             return label
 
-    # 3. Substring ngược: output nằm trong label
+    # 3. Substring match
     for label in valid_labels:
-        if first_line in label.lower() and len(first_line) > 4:
+        if label.lower() in first_line:
             return label
 
     # 4. Fuzzy difflib
@@ -55,7 +54,6 @@ def fuzzy_match_label(raw_pred: str, valid_labels: list[str]) -> str:
             if label.lower() == matches[0]:
                 return label
 
-    # Không match → trả về raw để debug
     return first_line
 
 
@@ -65,17 +63,25 @@ class IntentClassification:
             config = yaml.safe_load(f)
 
         self.checkpoint = config.get("model_checkpoint", "outputs/banking-intent-model")
-        self.max_seq_length = config.get("max_seq_length", 256)
+        self.max_seq_length = config.get("max_seq_length", 1024)
 
-        # Load valid labels từ file train đã lưu
+        # Load labels và label_list_str từ train
         labels_path = os.path.join(self.checkpoint, "labels.json")
+        label_str_path = os.path.join(self.checkpoint, "label_list_str.txt")
+
         if os.path.exists(labels_path):
-            with open(labels_path, "r") as f:
+            with open(labels_path) as f:
                 self.valid_labels = json.load(f)
             print(f"[INFO] Loaded {len(self.valid_labels)} valid labels")
         else:
-            self.valid_labels = None
-            print("[WARN] labels.json not found — fuzzy matching disabled")
+            raise FileNotFoundError(f"labels.json not found in {self.checkpoint}. Retrain first.")
+
+        if os.path.exists(label_str_path):
+            with open(label_str_path) as f:
+                self.label_list_str = f.read().strip()
+        else:
+            # Fallback: tự build lại
+            self.label_list_str = ", ".join(sorted(self.valid_labels))
 
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=self.checkpoint,
@@ -85,7 +91,6 @@ class IntentClassification:
         )
         FastLanguageModel.for_inference(self.model)
 
-        # Stop tokens an toàn — lọc None và <unk>
         unk_id = self.tokenizer.convert_tokens_to_ids("<unk>")
         candidates = [
             self.tokenizer.eos_token_id,
@@ -97,35 +102,29 @@ class IntentClassification:
         print(f"[INFO] Stop token IDs: {self.terminators}")
 
     def __call__(self, message: str) -> str:
-        prompt = PROMPT_TEMPLATE.format(message)
+        prompt = build_prompt(self.label_list_str, message)
         inputs = self.tokenizer([prompt], return_tensors="pt").to("cuda")
         input_len = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=15,       # label dài nhất ~5 tokens, 15 là đủ
+                max_new_tokens=15,
                 use_cache=True,
                 eos_token_id=self.terminators,
                 pad_token_id=self.tokenizer.eos_token_id,
-                do_sample=False,         # greedy — classification không cần sampling
+                do_sample=False,
                 repetition_penalty=1.2,
             )
 
-        # Chỉ decode phần MỚI sinh ra, không decode lại prompt
         new_tokens = outputs[0][input_len:]
         raw_label = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-        # Fuzzy match về label hợp lệ
-        if self.valid_labels:
-            predicted_label = fuzzy_match_label(raw_label, self.valid_labels)
-        else:
-            predicted_label = raw_label.splitlines()[0].strip()
+        predicted = fuzzy_match_label(raw_label, self.valid_labels)
 
         del inputs, outputs
         torch.cuda.empty_cache()
 
-        return predicted_label
+        return predicted
 
 
 if __name__ == "__main__":
@@ -169,8 +168,8 @@ if __name__ == "__main__":
 
         print("\n--- DEBUG: First 10 predictions ---")
         for i in range(min(10, total)):
-            match = "✅" if y_true_clean[i] == y_pred_clean[i] else "❌"
-            print(f"{match} TRUE: '{y_true_clean[i]}' | PRED: '{y_pred_clean[i]}'")
+            mark = "✅" if y_true_clean[i] == y_pred_clean[i] else "❌"
+            print(f"{mark} TRUE: '{y_true_clean[i]}' | PRED: '{y_pred_clean[i]}'")
 
     except FileNotFoundError:
         print("Error: sample_data/test.csv not found. Run preprocess_data.py first.")
